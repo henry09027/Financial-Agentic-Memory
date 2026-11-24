@@ -1,0 +1,16 @@
+# Python 3.10+ on Linux (Python 3.12 recommended).
+# python3 -m venv .venv
+# . .venv/bin/activate
+# python -m pip install -r requirements.txt
+#
+# Downloader: yfinance, pandas, requests and lxml (constituent table).
+# Generator: pandas, numpy and ijson (memory-bounded export verification).
+# All other imports are from the Python standard library.
+# No Snowflake, notebook, GPU or LLM dependencies.
+# Pin yfinance: explicit no-history/error handling is verified for this version.
+yfinance==0.2.66
+pandas>=2.2.3,<3.0
+numpy>=1.26.4,<3.0
+requests>=2.32.4,<3.0
+lxml>=5.3.0,<7.0
+ijson>=3.3.0,<4.0
