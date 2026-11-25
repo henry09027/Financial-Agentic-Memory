@@ -1,0 +1,5 @@
+# Step 3 (run_knowledge_graph_benchmark.py, run_mcp_benchmark.py) on Linux with an NVIDIA GPU.
+# Install a torch/CUDA build that matches your driver; --backend fake and --self-test need only PyYAML (MCP).
+vllm==0.34.0       # version pinned by the original MCP pilot
+huggingface_hub
+PyYAML

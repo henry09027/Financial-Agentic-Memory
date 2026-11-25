@@ -1,0 +1,6 @@
+# Steps 0-1 (build_universe.py, download_edgar.py, download_broker.py).
+# pipeline_common.py and both generators (step 2) use only the Python 3.10+ standard library.
+requests>=2.31
+pandas>=2.0
+lxml>=4.9          # pandas.read_html for the Wikipedia universe
+yfinance==0.2.66   # pinned: verified-empty detection depends on this version's exception text
