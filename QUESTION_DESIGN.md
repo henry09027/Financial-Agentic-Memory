@@ -177,8 +177,10 @@ For each difficulty and context size (a *stratum*), the generator collects exact
 `--per-stratum` examples (default 300). With 5 levels and 6 sizes, that is 9,000 examples
 per domain.
 
-Proposals continue until every stratum of a level is full, or until
-`--max-candidates-per-level` proposals have been tried. Full strata are skipped. A base
+Proposals continue until every stratum of a level is full, or until the candidate supply
+runs out: EDGAR enumerates a finite candidate set and has no cap by default
+(`--max-candidates-per-level 0`); broker samples proposals and stops after
+`--max-candidates-per-level` attempts (default 400,000). Full strata are skipped. A base
 question may therefore end up with only some of its size variants (a *partial family*).
 
 If any stratum is short, only the audit file is written and the script exits with code 2.
@@ -186,11 +188,14 @@ If any stratum is short, only the audit file is written and the script exits wit
 
 ### 2.11 Everything is deterministic
 
-Each level and template has its own random generator, seeded from `--seed` (default
-20261124). The order of each context is shuffled with a seed derived from
+Every random choice (the broker's proposals, EDGAR's unit order and rotation, L3 peer
+choices) is seeded from `--seed` (default 20261124). The order of each context is shuffled with a seed derived from
 `[base_id, radius, seed]`, so gold records do not cluster at the top. Running the generator
-again on the same raw file produces the same benchmark. The `.audit.json` sidecar records
-every proposal, with its outcome and per-radius reasons.
+again on the same raw file produces the same benchmark. The `.audit.json` sidecar counts
+every candidate by level, template and reason. It also logs informative candidates in
+detail, with per-radius outcomes: accepted ones, and ones whose neighbourhoods failed for a
+substantive reason. Early rejections, and candidates blocked only by full quotas or
+unrequested sizes, are counted but not logged; otherwise the file would grow to gigabytes.
 
 ---
 
@@ -221,7 +226,10 @@ was current at a given time, and how did it change?*
 
 ### 3.2 Scope and eligibility
 
-**Metric families.** There are six `item` values:
+**Metric families.** There are 50 `item` values covering 53 us-gaap concepts, defined once
+in `download_edgar.py` and imported by the generator.
+
+*Six core families.* `revenue` groups four concepts; each of the others is one concept:
 
 | item | XBRL concepts | unit |
 |---|---|---|
@@ -231,6 +239,25 @@ was current at a given time, and how did it change?*
 | operating_income | OperatingIncomeLoss | USD |
 | operating_cash_flow | NetCashProvidedByUsedInOperatingActivities | USD |
 | capital_expenditure | PaymentsToAcquirePropertyPlantAndEquipment | USD |
+
+*44 expansion families.* Each is exactly one concept, and the family name is a readable
+label of that concept (for example `GrossProfit` → `gross_profit`). All are in USD except
+`basic_eps` (USD/shares). They were added because six families did not supply enough
+candidates to fill all 30 difficulty × context-size strata.
+
+| Group | Families |
+|---|---|
+| Income statement | gross_profit, cost_of_revenue, cost_of_goods_and_services_sold, research_and_development_expense, selling_general_and_administrative_expense, interest_expense, interest_and_debt_expense, income_tax_expense_benefit, pretax_income, pretax_income_before_equity_method_investments, basic_eps, restructuring_costs, goodwill_impairment, asset_impairment_charges, advertising_expense, operating_lease_cost, income_available_to_common_shareholders, continuing_operations_income, comprehensive_income, other_comprehensive_income, deferred_income_tax_expense_benefit |
+| Financial sector | credit_loss_provision, net_interest_income_expense, investment_interest_income, noninterest_income, noninterest_expense, net_policyholder_benefits_and_claims |
+| Cash flow | investing_cash_flow, financing_cash_flow, share_based_compensation, depreciation_depletion_and_amortization, intangible_asset_amortization, common_dividend_payments, common_stock_repurchases, business_acquisition_cash_payments, long_term_debt_issuance_proceeds, long_term_debt_repayments, net_interest_paid, net_income_taxes_paid, operating_lease_payments, investment_purchase_payments, investment_sale_maturity_collection_proceeds, stock_option_exercise_proceeds, equity_compensation_tax_withholding_payments |
+
+Coverage varies widely across families. Financial-sector concepts exist mainly for banks
+and insurers, and several concepts (goodwill impairment, restructuring) are reported only
+in some years. `metadata.item_mix` shows how many examples each family contributed.
+
+Several new families are expenses or cash outflows. For these, an "increase" in an L5
+question means numerically higher, not better performance; the L5 wording already states
+this.
 
 Different revenue concepts are **not merged**. A series is always one exact concept.
 
@@ -334,7 +361,7 @@ floating-point edge cases. Questions with no qualifying revision are rejected
 **Parameters.**
 * two series of the same company, concept and unit with different periods (any two periods,
   quarterly or annual);
-* a cutoff.
+* a cutoff, which is a filing date of one of the two series.
 
 **Gold.** For each period, the record with the greatest `filed` on or before the cutoff.
 
@@ -355,7 +382,8 @@ so the trap is to assume a later version exists.
 
 **Parameters.**
 * one series;
-* `boundary`, one of the series' filing dates;
+* `boundary`, one of the series' filing dates other than the first (the first has no
+  earlier filing to compare with);
 * a cutoff, a filing date on or after the boundary.
 
 **Gold.** The latest record filed strictly before the boundary, and the earliest record filed
@@ -431,18 +459,36 @@ of revised and unchanged L5 questions.
 
 ### 3.4 How EDGAR candidates are proposed
 
-**L1–L4.** For each proposal:
+EDGAR does **not** sample proposals at random. It enumerates every *structural candidate*
+exactly once, then accepts candidates until the quotas fill. A structural candidate is one
+combination of parameters that the data make possible:
 
-1. Pick the metric family in round-robin order, so all six families are represented.
-2. Pick a random series in that family, and a random (filing date, accession) from its
-   history. That filing date is the cutoff, except for L4.
-3. Add the level-specific parameters described in section 3.3.
+| Level | Unit | Candidates per unit |
+|---|---|---|
+| L1 | series | one per filing (that filing's accession; cutoff = its filing date) |
+| L2 | series | filings × 3 windows (90/365/730 days) × 4 thresholds (1/5/10/20%) |
+| L3 | series | one per filing, paired with a peer period of the same company, concept and unit (peer chosen with a seed) |
+| L4 | series | every boundary filing except the first × every cutoff filing on or after it |
+| L5 | adjacent annual pair | every shared-accession filing day except the first |
 
-The cutoff is anchored to a real filing date because filings are sparse (about four per
-year per series). A random calendar day would usually fall between filings and produce many
-duplicate questions.
+**Interleaving.** Units are shuffled with the seed and visited round-robin. Round *r* takes
+one candidate from every unit that still has candidates left, starting from a seeded offset
+within each unit. The full candidate set is the same as walking one series to the end
+before moving to the next. The order differs: the first accepted questions come from many
+different companies and series, instead of a single series supplying many near-identical
+questions.
 
-**L5.** Candidates come from the enumeration described in section 3.3.5.
+**Cap.** `--max-candidates-per-level 0` (the default) means no cap. The generator stops when
+every stratum of the level is full, or when every candidate has been tried. A positive value
+caps the number of candidates per level for quick experiments.
+
+**Diversity report.** `metadata.diversity` reports, for each level, how many distinct base
+questions, companies, series and families the published examples come from. Check it after
+generation to confirm that no small set of series dominates.
+
+**Why the cutoff is a filing date.** Filings are sparse (about four per year per series). A
+random calendar day would usually fall between filings and produce many duplicate
+questions.
 
 ### 3.5 EDGAR neighbourhoods and distractors
 

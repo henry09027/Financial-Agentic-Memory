@@ -13,8 +13,6 @@ step  script                              reads                              wri
 2b    generate_broker_benchmark.py        raw/broker_revisions.json          benchmarks/broker.json (+ broker.audit.json)
 3a    run_knowledge_graph_benchmark.py    benchmarks/<domain>.json           results/<domain>/knowledge_graph/<split>/
 3b    run_mcp_benchmark.py                benchmarks/<domain>.json           results/<domain>/mcp/<split>/
-3c    run_rag_benchmark.py                benchmarks/<domain>.json           results/<domain>/rag/<A>_vs_<B>/<split>/
-3d    run_llm_benchmark.py                benchmarks/<domain>.json           results/<domain>/llm/<split>/
 shared: pipeline_common.py (stdlib only; steps 0-3), retrieval_common.py (step 3), semantic_models/<domain>.yaml (3b)
 ```
 
@@ -34,24 +32,7 @@ python generate_broker_benchmark.py
 pip install -r requirements-gpu.txt                    # Linux + NVIDIA GPU
 python run_knowledge_graph_benchmark.py --input artifacts/benchmarks/broker.json --smoke-test
 python run_mcp_benchmark.py            --input artifacts/benchmarks/edgar.json
-python run_rag_benchmark.py            --input artifacts/benchmarks/edgar.json   # --conditions bm25 dense (default)
-python run_llm_benchmark.py            --input artifacts/benchmarks/edgar.json
 ```
-
-### Step 3 methods
-
-| Method | Conditions (paired) | What the model sees | Model output |
-|---|---|---|---|
-| `knowledge_graph` | `traditional` / `temporal` | stage 1: all evidence; stage 2: its own graph only | graph, then evidence IDs |
-| `mcp` | `baseline` / `semantic_model` | question + table schema (+ YAML), no rows | SQL, executed locally |
-| `rag` | any two of `tfidf`, `bm25`, `dense`, `hybrid` | question + top-`--top-k` records from a non-model ranker | evidence IDs |
-| `llm` | `as_supplied` / `chronological` | question + all evidence (reordered, never filtered) | evidence IDs |
-
-`rag` compares two rankers per run; run it again with another `--conditions` pair to compare
-more (each pair gets its own run directory). Contexts no larger than `--top-k` are shown in full.
-`retrieval_summary.json` (rag only) reports recall@k, the share of examples whose gold was fully
-retrieved (the ranker's ceiling) and the reader's accuracy on those examples. Dense embeddings are
-computed before vLLM loads and the embedding model is released; pin it with `--embedding-revision`.
 
 Every script supports `--self-test`: it runs offline and writes no artifacts. The benchmark
 self-tests use a fake model on the CPU.
@@ -107,6 +88,22 @@ The status is one of: `ok, input_error, context_overflow, truncated, generation_
 | `benchmark_knowledge_graph_linux.py` | `run_knowledge_graph_benchmark.py` |
 | `benchmark_mcp_linux.py` | `run_mcp_benchmark.py` |
 | `evidence_semantic_model.yaml` | `semantic_models/broker.yaml` (**move it yourself**; optionally add `domain: broker`) |
+
+## EDGAR scope and candidate generation
+
+* **Scope.** `download_edgar.py` collects 50 metric families covering 53 us-gaap concepts:
+  * 6 core families (revenue groups four concepts);
+  * 44 single-concept expansion families, added so all 30 strata can reach 300 examples.
+* **Changing the concept list.** `--resume` refuses to continue a checkpoint made with a
+  different concept list. Re-download with `--overwrite`.
+* **Candidate generation.** `generate_edgar_benchmark.py` enumerates every structural
+  candidate exactly once, interleaved across shuffled series. There is no cap by default
+  (`--max-candidates-per-level 0`).
+* **What to check after a run.** `metadata.item_mix` and `metadata.diversity` show how many
+  families, companies and series the examples came from.
+* **Audit file.** Both generators count every candidate in the `.audit.json` sidecar. Only
+  informative candidates are logged in detail, which keeps the audit small under exhaustive
+  enumeration.
 
 ## Breaking changes: regenerate everything
 

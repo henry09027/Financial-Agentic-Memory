@@ -212,6 +212,17 @@ def get_logger(script: str) -> logging.Logger:
     return logging.getLogger("fam." + script)
 
 
+@contextmanager
+def quiet(logger: logging.Logger, level: int = logging.WARNING) -> Iterator[None]:
+    """Silence routine progress logs, e.g. during the preflight self-test before a real run."""
+    previous = logger.level
+    logger.setLevel(level)
+    try:
+        yield
+    finally:
+        logger.setLevel(previous)
+
+
 def setup_logging(level: str = "INFO", log_file: Path | None = None) -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if log_file is not None:
@@ -566,7 +577,7 @@ EDGAR_EVIDENCE_SCHEMA = {
         _field("entity_name", "string", "Company name."),
         _field("taxonomy", "string", "XBRL taxonomy, always us-gaap."),
         _field("concept", "string", "XBRL concept name, e.g. Revenues."),
-        _field("item", "string", "Metric family: revenue, net_income, diluted_eps, operating_income, operating_cash_flow or capital_expenditure."),
+        _field("item", "string", "Metric family, e.g. revenue, net_income, diluted_eps, gross_profit or interest_expense; one family groups one or more XBRL concepts."),
         _field("label", "string", "Human-readable XBRL concept label.", nullable=True),
         _field("unit", "string", "Unit of val: USD or USD/shares."),
         _field("start", "date", "First day of the measured period, YYYY-MM-DD."),
@@ -668,16 +679,20 @@ def add_generator_arguments(parser: argparse.ArgumentParser, *, input_default: P
     parser.add_argument("--per-stratum", type=int, default=DEFAULT_PER_STRATUM, help="Examples per difficulty x context size")
     parser.add_argument("--sizes", type=int, nargs="+", default=list(DEFAULT_SIZES), help="Context sizes (each >= 5)")
     parser.add_argument("--radii", type=int, nargs="+", default=list(DEFAULT_RADII), help="Neighborhood radii in days")
-    parser.add_argument("--max-candidates-per-level", type=int, default=max_candidates)
+    parser.add_argument("--max-candidates-per-level", type=int, default=max_candidates,
+                        help=f"Candidate cap per difficulty (default: {max_candidates or 'none; 0 = no cap'})")
     parser.add_argument("--id-width", type=int, default=DEFAULT_ID_WIDTH, help="Hex characters in evidence IDs (12-64)")
     parser.add_argument("--allow-partial", action="store_true", help="Accept a raw download whose status is partial")
     parser.add_argument("--allow-shortfall", action="store_true", help="Publish an unbalanced benchmark labeled complete=false")
     add_common_arguments(parser)
 
 
-def validate_generator_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if min(args.per_stratum, args.max_candidates_per_level) < 1:
-        parser.error("--per-stratum and --max-candidates-per-level must be positive")
+def validate_generator_args(parser: argparse.ArgumentParser, args: argparse.Namespace, allow_unbounded: bool = False) -> None:
+    """allow_unbounded: the generator enumerates a finite candidate set, so 0 (no cap) terminates."""
+    if args.per_stratum < 1:
+        parser.error("--per-stratum must be positive")
+    if args.max_candidates_per_level < (0 if allow_unbounded else 1):
+        parser.error("--max-candidates-per-level must be " + ("nonnegative (0 = no cap)" if allow_unbounded else "positive"))
     if not 12 <= args.id_width <= 64:
         parser.error("--id-width must be 12..64")
     if any(size < 5 for size in args.sizes) or len(set(args.sizes)) != len(args.sizes):
@@ -696,15 +711,43 @@ def base_identifier(domain: str, snapshot_hash: str, template_id: str, identity:
     return "b_" + stable_hash([BENCHMARK_SCHEMA, domain, snapshot_hash, template_id, identity])[:24]
 
 
-def open_raw_input(path: Path, kind: str, allow_partial: bool) -> EnvelopeReader:
+DOWNLOADERS = {"edgar_facts": "download_edgar.py", "broker_revisions": "download_broker.py"}
+
+
+def failure_report(entity_status: dict, limit: int = 8) -> list[str]:
+    """Failed/pending entities grouped by error message, most common first."""
+    groups: dict[str, list[str]] = {}
+    for key, item in entity_status.items():
+        if item.get("status") in {"failed", "pending"}:
+            message = item.get("error") or "pending (never attempted; the run was interrupted or aborted)"
+            groups.setdefault(message[:200], []).append(key)
+    lines = []
+    for message, keys in sorted(groups.items(), key=lambda pair: -len(pair[1]))[:limit]:
+        sample = ", ".join(keys[:6]) + (f", ... (+{len(keys) - 6})" if len(keys) > 6 else "")
+        lines.append(f"{len(keys):4d} x {message}  [{sample}]")
+    return lines
+
+
+def open_raw_input(path: Path, kind: str, allow_partial: bool, logger: logging.Logger | None = None) -> EnvelopeReader:
     reader = EnvelopeReader(path, kind, SCHEMAS[kind])
-    status = reader.metadata.get("status")
+    metadata = reader.metadata
+    status = metadata.get("status")
     if status not in {"complete", "partial"}:
         reader.close()
         raise PipelineError(f"{path}: missing download status")
-    if status != "complete" and not allow_partial:
-        reader.close()
-        raise PipelineError(f"{path} is a partial download; resume the downloader or pass --allow-partial")
+    if status == "partial":
+        missing = metadata.get("entities_failed_or_pending", "?")
+        report = "\n  ".join(failure_report(metadata.get("entity_status", {})))
+        summary = (f"{path} is a partial download: {missing} of {metadata.get('entities_requested', '?')} "
+                   f"entities failed or were never fetched:\n  {report}")
+        if not allow_partial:
+            reader.close()
+            raise PipelineError(
+                f"{summary}\nNext step: python {DOWNLOADERS.get(kind, 'the downloader')} --resume  (retries only those "
+                "entities). If the same entities keep failing (e.g. delisted or unsupported symbols), pass --allow-partial; "
+                "the benchmark is then built without them and the gap is recorded in its source metadata.")
+        if logger is not None:
+            logger.warning("%s\nContinuing because --allow-partial was given.", summary)
     return reader
 
 
@@ -771,7 +814,14 @@ class FamilyChecker:
 
 
 class AuditLog:
-    """Streams one record per generation candidate into the benchmark's .audit.json sidecar."""
+    """The benchmark's .audit.json sidecar.
+
+    Every candidate is counted by level, template and reason (metadata.rejection_counts and
+    candidate_counts). Detailed records (with per-radius neighborhood outcomes) are written only
+    for informative candidates: accepted ones, and ones whose neighborhoods failed for a
+    substantive reason. Early rejections and candidates blocked only by full quotas or
+    unrequested sizes are counted, not logged, because enumeration can try tens of millions.
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -779,11 +829,26 @@ class AuditLog:
         self.reasons: dict[str, int] = {}
         self.attempts: dict[str, int] = {}
 
-    def add(self, level: int, template_id: str, attempt: int, reason: str, **details: Any) -> None:
+    def count(self, level: int, template_id: str, reason: str) -> None:
         self.reasons[f"L{level}:{template_id}:{reason}"] = self.reasons.get(f"L{level}:{template_id}:{reason}", 0) + 1
         self.attempts[f"L{level}"] = self.attempts.get(f"L{level}", 0) + 1
+
+    def add(self, level: int, template_id: str, attempt: int, reason: str, **details: Any) -> None:
+        self.count(level, template_id, reason)
         self.writer.add({"level": level, "template_id": template_id, "attempt": attempt,
                          "accepted": reason == "accepted", "reason": reason, **details})
+
+    ROUTINE_NEIGHBORHOOD_REASONS = frozenset({"stratum_quota_full", "context_size_not_requested", "duplicate_neighborhood"})
+
+    def outcome(self, level: int, template_id: str, attempt: int, neighborhoods: list[dict], **details: Any) -> None:
+        """Record a gold-resolving candidate. Detailed only when informative: something was accepted, or a
+        neighborhood failed for a substantive reason (not merely a full quota or an unrequested size)."""
+        accepted = any(entry["reason"] == "accepted" for entry in neighborhoods)
+        reason = "accepted" if accepted else "no_unfilled_valid_neighborhood"
+        if accepted or any(entry["reason"] not in self.ROUTINE_NEIGHBORHOOD_REASONS for entry in neighborhoods):
+            self.add(level, template_id, attempt, reason, neighborhoods=neighborhoods, **details)
+        else:
+            self.count(level, template_id, reason)
 
     def close(self) -> None:
         self.writer.__exit__()
@@ -940,6 +1005,9 @@ def run_download(*, script: str | Path, args: argparse.Namespace, logger: loggin
                     "Universe changed since the checkpoint; start a new snapshot with --overwrite")
             require(state["client_versions"] == base_metadata.get("client_versions"),
                     "Client library versions changed since the checkpoint; reinstall them or start over with --overwrite")
+            require(state.get("metrics_sha256") == stable_hash(base_metadata.get("metrics")),
+                    "The configured metrics/concepts changed since the checkpoint; cached entities would mix old and "
+                    "new concept sets. Start a new snapshot with --overwrite")
         else:
             for path, _ in endpoints.values():
                 check_output(path, args.overwrite)
@@ -951,7 +1019,8 @@ def run_download(*, script: str | Path, args: argparse.Namespace, logger: loggin
             state = {"format": "fam-download-checkpoint-v1", "started_at": started, "keys": keys,
                      "snapshot_id": stable_hash([started, keys, universe_reference["file_sha256"]])[:32],
                      "universe_sha256": universe_reference["file_sha256"],
-                     "client_versions": base_metadata.get("client_versions")}
+                     "client_versions": base_metadata.get("client_versions"),
+                     "metrics_sha256": stable_hash(base_metadata.get("metrics"))}
             atomic_write_json(checkpoint_path, state)
         snapshot_dir = cache_root / state["snapshot_id"]
         results: dict[str, dict[str, dict]] = {}
@@ -1012,6 +1081,9 @@ def _export_endpoint(path, kind, endpoint, keys, entity_key, results, state, uni
                         universe=universe_reference, entity_status=statuses)
         writer.publish(metadata)
     logger.info("Saved %s: %d records; %d failed/pending entities", path, writer.count, failed)
+    if failed:
+        logger.warning("%s failures by cause:\n  %s\nRe-run with --resume to retry only these.",
+                       endpoint, "\n  ".join(failure_report(statuses)))
     return failed
 
 

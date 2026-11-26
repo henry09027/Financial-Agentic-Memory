@@ -14,6 +14,14 @@ Default target: 300 examples per difficulty x context size (5,10,20,30,40,50) = 
 Natural, gold-centered neighborhoods are NEVER padded or trimmed. A shortfall writes
 only the audit and exits 2; --allow-shortfall publishes complete=false.
 
+Scope: the 50 metric families (53 us-gaap concepts) configured in download_edgar.py:
+6 core families plus 44 single-concept expansion families.
+
+Proposals: every structural candidate is enumerated exactly once (no random sampling),
+interleaved round-robin across shuffled series so quotas fill from many different series.
+--max-candidates-per-level 0 (default) means no cap. Early rejections are only counted in
+the audit; candidates that resolve gold are logged in detail.
+
 Templates
   L1_accession_lookup     value reported in a named filing
   L2_revision_threshold   consecutive-filing revisions above a percentage threshold
@@ -47,7 +55,7 @@ import re
 
 from download_edgar import CONCEPTS
 from pipeline_common import (DEFAULT_PATHS, EDGAR_EVIDENCE_SCHEMA as SCHEMA, GOLD_CONTRACT_VERSION, LEVELS, AuditLog,
-                             CandidateRejected, FamilyChecker, PipelineError, add_generator_arguments, audit_path_for,
+                             CandidateRejected, FamilyChecker, PipelineError, add_generator_arguments, quiet, audit_path_for,
                              base_identifier, benchmark_metadata, check_output, decimal_text, exclusive_lock,
                              finalize_question, generator_config, get_logger, make_example, open_raw_input,
                              publish_benchmark, reference, require, run_main, setup_logging, split_for_entities,
@@ -149,9 +157,8 @@ class Dataset:
             self.histories[key] = history
         require(self.histories, "No eligible evidence remains after filtering")
         self.proposals = {key: sorted(values) for key, values in proposals.items()}
-        self.by_item, self.peers, self.groups = defaultdict(list), defaultdict(list), defaultdict(list)
+        self.peers, self.groups = defaultdict(list), defaultdict(list)
         for key in sorted(self.proposals):
-            self.by_item[CONCEPTS[key[2]][0]].append(key)
             self.peers[key[:4]].append(key)
         for key, history in self.histories.items():
             self.groups[(key[0], CONCEPTS[key[2]][0])].extend(history)
@@ -159,7 +166,6 @@ class Dataset:
         for group, rows in self.groups.items():
             rows.sort(key=lambda record: (record["filed"], record["evidence_id"]))
             self.days[group] = [date.fromisoformat(record["filed"]).toordinal() for record in rows]
-        self.items = sorted(self.by_item)
         self.audit.update(eligible_series=len(self.histories), eligible_records=sum(map(len, self.histories.values())))
         self.snapshot = stable_hash(sorted(registry.values()))
 
@@ -367,59 +373,107 @@ def question(level: int, params: dict) -> str:
     return finalize_question(text, params["cutoff"], RULES)
 
 
-def annual_candidates(dataset: Dataset, rng: random.Random):
-    keys = sorted(dataset.proposals)
-    rng.shuffle(keys)
+L2_WINDOWS_DAYS = (90, 365, 730)
+L2_THRESHOLDS_PCT = (1, 5, 10, 20)
+
+
+def annual_units(dataset: Dataset) -> list[tuple]:
+    """(older, newer, cutoffs): adjacent annual periods and every shared-accession filing day except the first."""
     starts = defaultdict(list)
-    for key in keys:
+    for key in dataset.proposals:
         starts[(key[:4], key[4])].append(key)
-    for older in keys:
+    units = []
+    for older in sorted(dataset.proposals):
         following = (date.fromisoformat(older[5]) + timedelta(days=1)).isoformat()
         for newer in sorted(starts[(older[:4], following)]):
             if not annual_pair(older, newer):
                 continue
             prior = {accession: day for day, accession in dataset.proposals[older]}
             common = sorted({day for day, accession in dataset.proposals[newer] if prior.get(accession) == day})
-            for cutoff in common[1:]:
-                yield CONCEPTS[older[2]][0], dict(entity=dataset.entities.get(older[0]),
-                                                  series=[list(older), list(newer)], cutoff=cutoff)
+            if len(common) > 1:
+                units.append((older, newer, common[1:]))
+    return units
 
 
-def propose(dataset: Dataset, level: int, item: str, rng: random.Random):
-    key = rng.choice(dataset.by_item[item])
-    history = dataset.proposals[key]
-    day, accession = rng.choice(history)
-    params = dict(entity=dataset.entities.get(key[0]), series=[list(key)], cutoff=day)
+def candidate_count(dataset: Dataset, level: int, unit) -> int:
+    """Number of structural candidates one series (or annual pair) contributes at a level."""
+    if level == 5:
+        return len(unit[2])
+    filings = len(dataset.proposals[unit])
+    if level == 1:
+        return filings
+    if level == 2:
+        return filings * len(L2_WINDOWS_DAYS) * len(L2_THRESHOLDS_PCT)
+    if level == 3:
+        return filings if len(dataset.peers[unit[:4]]) > 1 else 0
+    return filings * (filings - 1) // 2  # L4: boundary at filing b >= 1, cutoff at any filing c >= b
+
+
+def candidate(dataset: Dataset, level: int, unit, index: int, seed: int) -> tuple[str, dict]:
+    """Decode the index-th structural candidate of one unit (deterministic, no sampling)."""
+    if level == 5:
+        older, newer, cutoffs = unit
+        return CONCEPTS[older[2]][0], dict(entity=dataset.entities.get(older[0]), series=[list(older), list(newer)],
+                                           cutoff=cutoffs[index])
+    key, history = unit, dataset.proposals[unit]
+    item, entity = CONCEPTS[key[2]][0], dataset.entities.get(key[0])
+    if level == 4:
+        boundary = 1
+        while index >= len(history) - boundary:
+            index -= len(history) - boundary
+            boundary += 1
+        return item, dict(entity=entity, series=[list(key)], cutoff=history[boundary + index][0],
+                          boundary=history[boundary][0])
+    filing = index % len(history)
+    day, accession = history[filing]
+    params = dict(entity=entity, series=[list(key)], cutoff=day)
     if level == 1:
         params["accession"] = accession
     elif level == 2:
-        params.update(window_start=(date.fromisoformat(day) - timedelta(days=rng.choice((90, 365, 730)))).isoformat(),
-                      threshold=rng.choice((1, 5, 10, 20)))
-    elif level == 4:
-        params.update(boundary=day, cutoff=rng.choice([later for later, _ in history if later >= day]))
-    else:
-        alternatives = [candidate for candidate in dataset.peers[key[:4]] if candidate != key]
-        if not alternatives:
-            return None
-        params["series"].append(list(rng.choice(alternatives)))
-        params["series"].sort()
-    return params
+        combination = index // len(history)
+        window = L2_WINDOWS_DAYS[combination // len(L2_THRESHOLDS_PCT)]
+        params.update(window_start=(date.fromisoformat(day) - timedelta(days=window)).isoformat(),
+                      threshold=L2_THRESHOLDS_PCT[combination % len(L2_THRESHOLDS_PCT)])
+    else:  # L3: pair the period with a seeded choice among the company's other periods of the same concept/unit
+        peers = [other for other in dataset.peers[key[:4]] if other != key]
+        peer = random.Random(stable_hash([seed, level, list(key), index])).choice(peers)
+        params["series"] = sorted([list(key), list(peer)])
+    return item, params
 
 
 def candidates(dataset: Dataset, level: int, args):
-    rng = random.Random(stable_hash([args.seed, DOMAIN, level, dataset.items]))
-    if level == 5:
-        for index, candidate in enumerate(annual_candidates(dataset, rng)):
-            if index >= args.max_candidates_per_level:
+    """Enumerate EVERY structural candidate exactly once, interleaved across units.
+
+    Units (series for L1-L4, annual period pairs for L5) are shuffled with the seed. Round r
+    yields candidate (offset_u + r) mod n_u of every unit that has more than r candidates, where
+    offset_u is a seeded per-unit rotation. Quotas therefore fill from many different series
+    first instead of exhausting one series before moving to the next. --max-candidates-per-level
+    caps the total (0 = no cap: run until quotas fill or every candidate has been tried).
+    """
+    units = annual_units(dataset) if level == 5 else sorted(dataset.proposals)
+    random.Random(stable_hash([args.seed, DOMAIN, level, "units"])).shuffle(units)
+    active = []
+    for unit in units:
+        count = candidate_count(dataset, level, unit)
+        if count:
+            label = [list(unit[0]), list(unit[1])] if level == 5 else list(unit)
+            active.append((unit, count, int(stable_hash([args.seed, level, label])[:8], 16) % count))
+    LOG.info("L%d: %d units, %d structural candidates", level, len(active), sum(count for _, count, _ in active))
+    produced, round_index = 0, 0
+    while active:
+        remaining = []
+        for unit, count, offset in active:
+            if args.max_candidates_per_level and produced >= args.max_candidates_per_level:
                 return
-            yield candidate
-        return
-    for index in range(args.max_candidates_per_level):
-        item = dataset.items[index % len(dataset.items)]
-        yield item, propose(dataset, level, item, rng)
+            produced += 1
+            yield candidate(dataset, level, unit, (offset + round_index) % count, args.seed)
+            if count > round_index + 1:
+                remaining.append((unit, count, offset))
+        active, round_index = remaining, round_index + 1
 
 
-def neighborhood(dataset: Dataset, group, gold_days, cutoff: int, radius: int) -> list[dict]:
+def neighborhood_span(dataset: Dataset, group, gold_days, cutoff: int, radius: int) -> tuple[int, list]:
+    """Size and merged index intervals of the natural neighborhood, without materializing it."""
     days = dataset.days[group]
     intervals = sorted((bisect_left(days, day - radius), min(bisect_right(days, day + radius), bisect_right(days, cutoff)))
                        for day in gold_days)
@@ -431,6 +485,11 @@ def neighborhood(dataset: Dataset, group, gold_days, cutoff: int, radius: int) -
             merged[-1][1] = max(end, merged[-1][1])
         else:
             merged.append([start, end])
+    return sum(end - start for start, end in merged), merged
+
+
+def neighborhood(dataset: Dataset, group, gold_days, cutoff: int, radius: int) -> list[dict]:
+    _, merged = neighborhood_span(dataset, group, gold_days, cutoff, radius)
     return [row for start, end in merged for row in dataset.groups[group][start:end]]
 
 
@@ -438,20 +497,12 @@ def generate(dataset: Dataset, args, audit: AuditLog) -> tuple[list[dict], Count
     examples, counts = [], Counter()
     for level in LEVELS:
         template_id = TEMPLATES[level]
-        seen_proposals, seen_effective = set(), set()
+        seen_effective = set()
         for attempt, (item, params) in enumerate(candidates(dataset, level, args)):
             if all(counts[(level, size)] >= args.per_stratum for size in args.sizes):
                 break
             if attempt and attempt % 100000 == 0:
                 LOG.info("L%d: %d candidates; coverage %s", level, attempt, [counts[(level, size)] for size in args.sizes])
-            if params is None:
-                audit.add(level, template_id, attempt, "no_second_period")
-                continue
-            proposal = stable_hash(params)
-            if proposal in seen_proposals:
-                audit.add(level, template_id, attempt, "duplicate_proposal")
-                continue
-            seen_proposals.add(proposal)
             keys = [tuple(key) for key in params["series"]]
             try:
                 if params["entity"] is None or any(key not in dataset.histories for key in keys):
@@ -465,12 +516,12 @@ def generate(dataset: Dataset, args, audit: AuditLog) -> tuple[list[dict], Count
                 require(evaluate_contract(full, specification) == gold, "Independent source gold mismatch")
                 split = split_for_entities([key[0] for key in keys])
             except CandidateRejected as error:
-                audit.add(level, template_id, attempt, str(error))
+                audit.count(level, template_id, str(error))
                 continue
             identity = {key: value for key, value in params.items() if key != "cutoff"}
             effective = stable_hash([template_id, identity, sorted(gold)])
             if effective in seen_effective:
-                audit.add(level, template_id, attempt, "duplicate_effective_question")
+                audit.count(level, template_id, "duplicate_effective_question")
                 continue
             seen_effective.add(effective)
             base = base_identifier(DOMAIN, dataset.snapshot, template_id, [identity, sorted(gold)])
@@ -480,9 +531,7 @@ def generate(dataset: Dataset, args, audit: AuditLog) -> tuple[list[dict], Count
             history_count = sum(row["filed"] <= params["cutoff"] for row in dataset.groups[group])
             neighborhoods, sizes_seen = [], set()
             for radius in args.radii:
-                context = neighborhood(dataset, group, gold_days, cutoff, radius)
-                size = len(context)
-                ids = {row["evidence_id"] for row in context}
+                size, merged = neighborhood_span(dataset, group, gold_days, cutoff, radius)
                 outcome = {"radius_days": radius, "context_size": size}
                 neighborhoods.append(outcome)
                 if size in sizes_seen:
@@ -495,6 +544,8 @@ def generate(dataset: Dataset, args, audit: AuditLog) -> tuple[list[dict], Count
                 if counts[(level, size)] >= args.per_stratum:
                     outcome["reason"] = "stratum_quota_full"
                     continue
+                context = [row for start, end in merged for row in dataset.groups[group][start:end]]
+                ids = {row["evidence_id"] for row in context}
                 if len(ids) != size or not gold < ids:
                     outcome["reason"] = "missing_gold_or_distractor"
                     continue
@@ -518,9 +569,7 @@ def generate(dataset: Dataset, args, audit: AuditLog) -> tuple[list[dict], Count
                                  "same_series_distractors": sum(series(row) in keys and row["evidence_id"] not in gold
                                                                 for row in context)}))
                 counts[(level, size)] += 1
-            accepted = [entry["context_size"] for entry in neighborhoods if entry["reason"] == "accepted"]
-            audit.add(level, template_id, attempt, "accepted" if accepted else "no_unfilled_valid_neighborhood",
-                      base_id=base, neighborhoods=neighborhoods)
+            audit.outcome(level, template_id, attempt, neighborhoods, base_id=base)
         LOG.info("L%d final coverage %s", level, [counts[(level, size)] for size in args.sizes])
     return examples, counts
 
@@ -554,17 +603,22 @@ def verify_all(examples: list[dict], dataset: Dataset, sizes) -> None:
 
 
 POLICIES = {
-    "proposal": "L1-L4: round-robin over metric items, random series and filing day; L5: enumerate annual period pairs "
-                "and shared-accession filing days in seeded order. --max-candidates-per-level caps every level.",
+    "proposal": "Exhaustive deterministic enumeration of structural candidates (no random sampling). L1: every filing of "
+                "every series; L2: every filing x window (90/365/730 days) x threshold (1/5/10/20%); L3: every filing "
+                "paired with a seeded peer period; L4: every boundary filing (after the first) x every cutoff filing on "
+                "or after it; L5: every adjacent annual pair x every shared-accession filing day after the first. "
+                "Units are shuffled and interleaved round-robin so quotas fill from many series. "
+                "--max-candidates-per-level 0 (default) means no cap.",
     "cutoff": "A filing date from the proposed series history.",
     "neighborhood": "All evidence of the same company and metric item filed within radius days of a gold filing and on or before the cutoff.",
-    "deduplication": "Exact duplicate proposals and duplicate effective questions (same template, parameters except cutoff, and gold) are rejected.",
+    "deduplication": "Duplicate effective questions (same template, parameters except cutoff, and gold) are rejected.",
     "stopping": "Exactly per_stratum examples per difficulty x context size; full strata are skipped; partial families allowed.",
 }
 LIMITATIONS = [
     "Current snapshot, not point-in-time historical API availability.",
     "Changes may reflect splits, recasts or errors, not formal restatements.",
     "Exact XBRL concepts are not merged; capital expenditure covers PP&E cash payments only.",
+    "Families differ in coverage: financial-sector concepts exist only for banks/insurers, so family mix is uneven.",
     "Natural neighborhoods and quota filtering introduce selection bias.",
     "Context variants of one base question are not independent; unchanged L5 controls are included.",
     "Universe membership is as recorded by build_universe.py, not historical index membership.",
@@ -616,7 +670,14 @@ def self_test() -> None:
     dataset = Dataset(synthetic_records(), 12)
     require(dataset.audit["outside_scope"] == 1 and dataset.histories, "Dataset filtering failed")
     args = argparse.Namespace(seed=1, per_stratum=2, sizes=list(range(5, 60)), radii=[0, 7, 14, 30, 60, 90, 180, 365, 730],
-                              max_candidates_per_level=4000)
+                              max_candidates_per_level=0)
+    for level in LEVELS:  # the interleaved enumeration yields every structural candidate exactly once
+        produced = [stable_hash(params) for _, params in candidates(dataset, level, args)]
+        units = annual_units(dataset) if level == 5 else list(dataset.proposals)
+        require(len(produced) == len(set(produced)) == sum(candidate_count(dataset, level, unit) for unit in units),
+                f"L{level} enumeration is not exhaustive and duplicate-free")
+    capped = argparse.Namespace(**dict(vars(args), max_candidates_per_level=7))
+    require(sum(1 for _ in candidates(dataset, 1, capped)) == 7, "Candidate cap ignored")
     import tempfile
     from pathlib import Path
     with tempfile.TemporaryDirectory() as directory:
@@ -639,21 +700,36 @@ def self_test() -> None:
     LOG.info("EDGAR generator self-test passed: %d examples across levels %s", len(examples), dict(sorted(by_level.items())))
 
 
+def diversity(examples: list[dict]) -> dict:
+    """How concentrated each level is: distinct companies, series and metric families behind its base questions."""
+    report = {}
+    for level in LEVELS:
+        rows = [example for example in examples if example["difficulty"] == level]
+        report[f"L{level}"] = {"examples": len(rows), "base_questions": len({row["base_id"] for row in rows}),
+                               "companies": len({row["entity_ciks"][0] for row in rows}),
+                               "series": len({tuple(map(tuple, row["parameters"]["series"])) for row in rows}),
+                               "items": len({row["diagnostics"]["item"] for row in rows})}
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_generator_arguments(parser, input_default=DEFAULT_PATHS["edgar_facts"],
-                            output_default=DEFAULT_PATHS["edgar_benchmark"], max_candidates=500000)
+                            output_default=DEFAULT_PATHS["edgar_benchmark"], max_candidates=0)
     args = parser.parse_args()
     setup_logging(args.log_level)
-    self_test()  # always: rule checks are cheap insurance before an hours-long generation
     if args.self_test:
+        self_test()
         return 0
-    validate_generator_args(parser, args)
+    with quiet(LOG):  # preflight: rule checks are cheap insurance before an hours-long generation
+        self_test()
+    LOG.info("Preflight self-test passed")
+    validate_generator_args(parser, args, allow_unbounded=True)
     source_path, output = args.input.resolve(), args.output.resolve()
     require(source_path != output and source_path != audit_path_for(output), "Input and outputs must differ")
     with exclusive_lock(output):
         check_output(output, args.overwrite)
-        with open_raw_input(source_path, "edgar_facts", args.allow_partial) as reader:
+        with open_raw_input(source_path, "edgar_facts", args.allow_partial, LOG) as reader:
             dataset = Dataset(reader, args.id_width)
             source = reference(reader)
         LOG.info("Prepared %d eligible observations in %d series", dataset.audit["eligible_records"], dataset.audit["eligible_series"])
@@ -669,6 +745,8 @@ def main() -> int:
                                           policies=POLICIES)
             metadata["answer_mix"] = {"L5": dict(Counter("revised" if example["private_answer"]["values_revised"] else "unchanged"
                                                          for example in examples if example["difficulty"] == 5))}
+            metadata["item_mix"] = dict(sorted(Counter(example["diagnostics"]["item"] for example in examples).items()))
+            metadata["diversity"] = diversity(examples)
             return publish_benchmark(output=output, audit=audit, examples=examples, metadata=metadata,
                                      check=lambda example: verify_common_example(example, SCHEMA, args.sizes),
                                      allow_shortfall=args.allow_shortfall, logger=LOG)

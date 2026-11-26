@@ -47,7 +47,7 @@ import tempfile
 from typing import Any
 
 from pipeline_common import (BROKER_EVIDENCE_SCHEMA as SCHEMA, DEFAULT_PATHS, GOLD_CONTRACT_VERSION, LEVELS, AuditLog,
-                             CandidateRejected, FamilyChecker, PipelineError, add_generator_arguments, audit_path_for,
+                             CandidateRejected, FamilyChecker, PipelineError, add_generator_arguments, quiet, audit_path_for,
                              base_identifier, benchmark_metadata, check_output, decimal_text, exclusive_lock,
                              finalize_question, generator_config, get_logger, make_example, open_raw_input,
                              publish_benchmark, reference, require, run_main, setup_logging, short_id,
@@ -493,13 +493,13 @@ class Benchmark:
                         raise CandidateRejected("no_gold")
                     split = split_for_entities(self.ciks[ticker] for ticker in params["tickers"])
                 except CandidateRejected as error:
-                    audit_log.add(level, template_id, attempt, str(error), cutoff=cutoff)
+                    audit_log.count(level, template_id, str(error))
                     continue
                 identity = {key: value for key, value in params.items() if key != "cutoff"}
                 identity["firms"], identity["tickers"] = sorted(identity["firms"]), sorted(identity["tickers"])
                 effective = stable_hash([template_id, identity, sorted(gold)])
                 if effective in seen_effective:
-                    audit_log.add(level, template_id, attempt, "duplicate_effective_question", cutoff=cutoff)
+                    audit_log.count(level, template_id, "duplicate_effective_question")
                     continue
                 seen_effective.add(effective)
                 base_id = base_identifier(DOMAIN, self.snapshot, template_id, [identity, sorted(gold)])
@@ -523,8 +523,7 @@ class Benchmark:
                     outcome["reason"] = "accepted"
                     survivors.append((radius, rows))
                 if not survivors:
-                    audit_log.add(level, template_id, attempt, "no_unfilled_valid_neighborhood", cutoff=cutoff,
-                                  base_id=base_id, neighborhoods=neighborhoods)
+                    audit_log.outcome(level, template_id, attempt, neighborhoods, cutoff=cutoff, base_id=base_id)
                     continue
                 contract = golden_conditions(template_id, params)
                 require(evaluate_golden_conditions(history, contract) == gold, "Source gold resolvers disagree")
@@ -721,15 +720,18 @@ def main() -> int:
                             output_default=DEFAULT_PATHS["broker_benchmark"], max_candidates=400000)
     args = parser.parse_args()
     setup_logging(args.log_level)
-    run_self_tests()  # always: rule checks are cheap insurance before an hours-long generation
     if args.self_test:
+        run_self_tests()
         return 0
+    with quiet(LOG):  # preflight: rule checks are cheap insurance before an hours-long generation
+        run_self_tests()
+    LOG.info("Preflight self-test passed")
     validate_generator_args(parser, args)
     source_path, output = args.input.resolve(), args.output.resolve()
     require(source_path != output and source_path != audit_path_for(output), "Input and outputs must differ")
     with exclusive_lock(output):
         check_output(output, args.overwrite)
-        with open_raw_input(source_path, "broker_revisions", args.allow_partial) as reader:
+        with open_raw_input(source_path, "broker_revisions", args.allow_partial, LOG) as reader:
             evidence, source_audit, ciks = prepare_evidence(reader, args.id_width)
             source = reference(reader)
         LOG.info("Source audit: %s", json.dumps(source_audit, sort_keys=True))

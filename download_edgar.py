@@ -8,7 +8,10 @@
 Input : artifacts/raw/universe.json (build_universe.py). One request per unique CIK
         (primary listing); every listed ticker of the CIK is kept in `tickers`.
 Output: artifacts/raw/edgar_facts.json (fam-envelope-v1, kind=edgar_facts).
-        Only the six configured metric families and their units are saved.
+        Only the 50 configured metric families (53 us-gaap concepts) and their units are
+        saved: 6 core families (revenue groups four concepts) plus 44 single-concept
+        expansion families added so every difficulty x context-size quota can fill.
+        Changing the concept list invalidates --resume; start over with --overwrite.
 
 Record fields
   pipeline: cik, ticker (primary listing), tickers, entity_name (universe name, as in the broker
@@ -38,6 +41,7 @@ from pipeline_common import (DEFAULT_PATHS, AbortDownload, PipelineError, Retrya
 
 LOG = get_logger("download_edgar")
 SOURCE_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+# Core families: several revenue concepts share one family; every other core family is one concept.
 ITEMS = {
     "revenue": {
         "RevenueFromContractWithCustomerExcludingAssessedTax": "USD",
@@ -49,7 +53,63 @@ ITEMS = {
     "operating_cash_flow": {"NetCashProvidedByUsedInOperatingActivities": "USD"},
     "capital_expenditure": {"PaymentsToAcquirePropertyPlantAndEquipment": "USD"},
 }
+# Expansion families (44): one XBRL concept each, added to fill every difficulty x context-size quota.
+# Concepts are never merged across families; units are USD except basic EPS (USD/shares).
+EXPANSION_LABELS = {
+    # Income statement
+    "GrossProfit": "gross_profit",
+    "CostOfRevenue": "cost_of_revenue",
+    "CostOfGoodsAndServicesSold": "cost_of_goods_and_services_sold",
+    "ResearchAndDevelopmentExpense": "research_and_development_expense",
+    "SellingGeneralAndAdministrativeExpense": "selling_general_and_administrative_expense",
+    "InterestExpense": "interest_expense",
+    "InterestAndDebtExpense": "interest_and_debt_expense",
+    "IncomeTaxExpenseBenefit": "income_tax_expense_benefit",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": "pretax_income",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments":
+        "pretax_income_before_equity_method_investments",
+    "EarningsPerShareBasic": "basic_eps",
+    "RestructuringAndRelatedCostIncurredCost": "restructuring_costs",
+    "GoodwillImpairmentLoss": "goodwill_impairment",
+    "AssetImpairmentCharges": "asset_impairment_charges",
+    "AdvertisingExpense": "advertising_expense",
+    "OperatingLeaseCost": "operating_lease_cost",
+    "NetIncomeLossAvailableToCommonStockholdersBasic": "income_available_to_common_shareholders",
+    "IncomeLossFromContinuingOperations": "continuing_operations_income",
+    "ComprehensiveIncomeNetOfTax": "comprehensive_income",
+    "OtherComprehensiveIncomeLossNetOfTax": "other_comprehensive_income",
+    "DeferredIncomeTaxExpenseBenefit": "deferred_income_tax_expense_benefit",
+    # Financial-sector income statement
+    "ProvisionForLoanLeaseAndOtherLosses": "credit_loss_provision",
+    "InterestIncomeExpenseNet": "net_interest_income_expense",
+    "InvestmentIncomeInterest": "investment_interest_income",
+    "NoninterestIncome": "noninterest_income",
+    "NoninterestExpense": "noninterest_expense",
+    "PolicyholderBenefitsAndClaimsIncurredNet": "net_policyholder_benefits_and_claims",
+    # Cash flow statement
+    "NetCashProvidedByUsedInInvestingActivities": "investing_cash_flow",
+    "NetCashProvidedByUsedInFinancingActivities": "financing_cash_flow",
+    "ShareBasedCompensation": "share_based_compensation",
+    "DepreciationDepletionAndAmortization": "depreciation_depletion_and_amortization",
+    "AmortizationOfIntangibleAssets": "intangible_asset_amortization",
+    "PaymentsOfDividendsCommonStock": "common_dividend_payments",
+    "PaymentsForRepurchaseOfCommonStock": "common_stock_repurchases",
+    "PaymentsToAcquireBusinessesNetOfCashAcquired": "business_acquisition_cash_payments",
+    "ProceedsFromIssuanceOfLongTermDebt": "long_term_debt_issuance_proceeds",
+    "RepaymentsOfLongTermDebt": "long_term_debt_repayments",
+    "InterestPaidNet": "net_interest_paid",
+    "IncomeTaxesPaidNet": "net_income_taxes_paid",
+    "OperatingLeasePayments": "operating_lease_payments",
+    "PaymentsToAcquireInvestments": "investment_purchase_payments",
+    "ProceedsFromSaleMaturityAndCollectionsOfInvestments": "investment_sale_maturity_collection_proceeds",
+    "ProceedsFromStockOptionsExercised": "stock_option_exercise_proceeds",
+    "PaymentsRelatedToTaxWithholdingForShareBasedCompensation": "equity_compensation_tax_withholding_payments",
+}
+for _concept, _label in EXPANSION_LABELS.items():
+    ITEMS[_label] = {_concept: "USD/shares" if _concept == "EarningsPerShareBasic" else "USD"}
 CONCEPTS = {concept: (item, unit) for item, concepts in ITEMS.items() for concept, unit in concepts.items()}
+if len(ITEMS) != 50 or len(CONCEPTS) != sum(map(len, ITEMS.values())):
+    raise RuntimeError("Metric configuration must define 50 families with each concept in exactly one family")
 
 
 def retry_after_seconds(value: str | None) -> float | None:
@@ -129,6 +189,12 @@ def self_test() -> None:
         "Unrelated": {"units": {"USD": [{"val": 3}]}}}}}
     records = records_for_company(data, entity, ["AAPL"])
     require(len(records) == 2 and records[0]["item"] == "revenue" and records[0]["val"] == 10, "Concept filter failed")
+    data["facts"]["us-gaap"]["GrossProfit"] = {"label": "Gross profit", "units": {"USD": [{"val": 4}]}}
+    data["facts"]["us-gaap"]["EarningsPerShareBasic"] = {"label": "EPS basic", "units": {"USD/shares": [{"val": 1.6}]}}
+    expanded = records_for_company(data, entity, ["AAPL"])
+    require(sorted(record["item"] for record in expanded) == ["basic_eps", "diluted_eps", "gross_profit", "revenue"],
+            "Expansion concept selection failed")
+    require(len(ITEMS) == 50 and len(CONCEPTS) == 53, "Metric configuration changed")
     require(records[0]["entity_name"] == "Apple" and records[0]["sec_entity_name"] == "Apple Inc."
             and records[0]["ticker"] == "AAPL", "Identity fields failed")
     try:
